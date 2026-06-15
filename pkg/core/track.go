@@ -3,11 +3,21 @@ package core
 import (
 	"encoding/json"
 	"errors"
+	"log"
+	"math"
+	"time"
 
 	"github.com/pion/rtp"
 )
 
 var ErrCantGetTrack = errors.New("can't get track")
+
+// audioTSDebug logs cumulative drift between an audio track's RTP clock and
+// wall-clock at the producer receive point (temporary instrument for
+// AlexxIT/go2rtc#2303 — the G.711 long-run audio-decay investigation). Logged
+// only when the drift moves >=0.5s, so a healthy track is near-silent and a
+// jump/drift shows up as a clear sequence. Remove before release.
+var audioTSDebug = true
 
 type Receiver struct {
 	Node
@@ -25,6 +35,38 @@ func NewReceiver(media *Media, codec *Codec) *Receiver {
 	r := &Receiver{
 		Node:  Node{id: NewID(), Codec: codec},
 		Media: media,
+	}
+	if audioTSDebug && codec != nil && codec.Kind() == KindAudio {
+		clock := float64(codec.ClockRate)
+		if clock <= 0 {
+			clock = 8000
+		}
+		var have bool
+		var lastTS uint32
+		var refWall time.Time
+		var rtpSamples int64 // cumulative samples since ref (wrap-safe)
+		var lastLogDrift float64
+		r.Input = func(packet *Packet) {
+			r.Bytes += len(packet.Payload)
+			r.Packets++
+			if !have {
+				have, lastTS, refWall = true, packet.Timestamp, time.Now()
+			} else {
+				rtpSamples += int64(int32(packet.Timestamp - lastTS)) // wrap-safe signed delta
+				lastTS = packet.Timestamp
+				drift := float64(rtpSamples)/clock - time.Since(refWall).Seconds()
+				if math.Abs(drift-lastLogDrift) >= 0.5 {
+					log.Printf("[audiots] %s ssrc=%d rtp=%.1fs wall=%.1fs drift=%+.2fs",
+						codec.Name, packet.SSRC, float64(rtpSamples)/clock,
+						time.Since(refWall).Seconds(), drift)
+					lastLogDrift = drift
+				}
+			}
+			for _, child := range r.childs {
+				child.Input(packet)
+			}
+		}
+		return r
 	}
 	r.Input = func(packet *Packet) {
 		r.Bytes += len(packet.Payload)
